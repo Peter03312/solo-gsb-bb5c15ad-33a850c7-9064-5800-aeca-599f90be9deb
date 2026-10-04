@@ -19,12 +19,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.13.0",
+    version="1.14.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
         "批次携带修订号、按整批最终关系核验，矛盾整批拒绝；"
         "支持关系查询（含支撑证据路径）与不可变定版快照；"
+        "正式关系查询（GET /relationship）与推演关系查询"
+        "（GET /projections/{id}/relationship）均在同一只读快照视图内完成，"
+        "一次响应的修订号 / 推演状态、关系结论、最优证据路径与逐步证据明细不混版："
+        "并发批次提交只可能整体读到提交前或提交后的完整视图；已关闭推演仍可查询冻结视图；"
         "支持野外终端离线短号记录的整包汇入（/field-packages）："
         "短号对照随包建立地层与跨包不可改绑的终端绑定，证据编号由终端/包号/序号稳定确定，"
         "整包最终关系核验、原子递增一次正式修订，同终端同包号内容重试幂等返回原结果；"
@@ -380,7 +384,14 @@ def get_field_package_correction(terminal_id: str, original_package_no: str, new
 # ------------------------------------------------------------------ 关系查询
 @app.get("/relationship", tags=["query"])
 def get_relationship(a: str = Query(description="地层编号"), b: str = Query(description="地层编号")):
-    """查询两地层当前关系：同一期 / 早于 / 晚于 / 未定，附支撑证据路径。"""
+    """查询两地层当前关系：同一期 / 早于 / 晚于 / 未定，附支撑证据路径。
+
+    一次响应中的正式修订号、关系结论、最优证据路径与逐步证据明细（含各证据 status）
+    取自同一 REPEATABLE READ READ ONLY 只读快照视图：并发正式批次（含野外整包汇入 /
+    勘误、推演并入）在查询的读取语句之间提交时，只可能整体返回提交前或提交后的结果，
+    不会出现旧修订号配新结论、或路径证据在明细中显示为已撤回的混版响应。地层未登记
+    仍返回 400 INVALID_STRATUM；路径规则不变（证据数最少、并列按证据编号序列字典序最小）。
+    """
     return service.query_relationship(a, b)
 
 
@@ -570,7 +581,15 @@ def post_projection_batch(projection_id: int, batch: ProjectionBatchIn):
 def get_projection_relationship(
     projection_id: int, a: str = Query(description="地层编号"), b: str = Query(description="地层编号")
 ):
-    """查询推演视角下两地层的关系及支撑证据路径（路径标注 base/projection 来源）。"""
+    """查询推演视角下两地层的关系及支撑证据路径（路径标注 base/projection 来源）。
+
+    一次响应中的推演状态、推演修订号、基线修订号、关系结论、最优证据路径与逐步证据
+    明细取自同一 REPEATABLE READ READ ONLY 只读快照视图：并发推演批次在读取语句之间
+    提交时，只可能整体返回提交前或提交后的冻结视图，不会出现旧推演修订号配新结论、
+    或路径证据在明细中显示为已撤回的混版响应。推演不存在 404 PROJECTION_NOT_FOUND；
+    地层不在推演基线内 400 INVALID_STRATUM；已关闭推演（merged/discarded）仍可查询
+    其冻结视图。
+    """
     return projections.query_projection_relationship(projection_id, a, b)
 
 

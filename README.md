@@ -14,6 +14,17 @@
 - **批次语义**：每批新增/撤回须携带当前修订号；按整批应用后的最终关系核验；
   发生矛盾时**整批拒绝**并返回冲突证据路径，原状态不变；全部通过则在同一事务内落库并**原子递增修订号**。
 - **路径选取**：多条证据路径时，取证据数最少者；并列时按证据编号序列字典序最小者。
+- **关系查询的完整视图一致性**：正式关系查询 `GET /relationship`（输入两地层编号）与
+  推演关系查询 `GET /projections/{id}/relationship`（另带推演编号）均在
+  **`REPEATABLE READ READ ONLY` 只读快照事务**内完成：一次响应中的修订号（推演另含
+  推演状态与推演修订号）、关系结论、最优证据路径 `evidence_path` 与逐步证据明细
+  `path_detail`（含每步 `status`）取自**同一完整视图**。并发正式批次（含野外整包
+  汇入 / 勘误、推演并入）或推演批次在查询的多条读取语句之间提交时，响应只可能整体
+  是**提交前**或整体是**提交后**的结果，不会出现旧修订号配新结论、或路径中的证据
+  在逐步明细中显示为已撤回的混版响应。查询入口、输入输出字段、未知地层
+  （400 `INVALID_STRATUM`）与未知推演（404 `PROJECTION_NOT_FOUND`）的错误约定、
+  路径选取规则（证据数最少、并列按证据编号序列字典序最小）均不变；**已关闭推演
+  （merged/discarded）仍可查询其冻结视图**。
 - **定版（快照）**：保存当前修订号下全部关系结论的不可变快照；后续撤回不影响旧版结论。
 - **专题成果包**：把某定版中的一组（≥2、不重复、已登记）地层封存为不可变、可转交
   复核包：只含按编号排序的无序两两关系，结论与最优路径同该定版查询，确定结论携带
@@ -673,6 +684,29 @@ bash examples/field_package_corrections_demo.sh
 
 `relation` 取值：`same_period`（同一期）/ `earlier_than`（早于）/ `later_than`（晚于）/ `undetermined`（未定）。
 
+**同一次响应同一完整视图**：`GET /relationship?a=...&b=...` 在一条
+`REPEATABLE READ READ ONLY` 只读快照事务内读取正式修订号、生效断言并推导关系结论、
+最优证据路径与逐步明细。查询期间若有正式批次（含野外整包汇入 / 勘误、推演并入）
+并发提交：
+
+- 整个响应要么对应该批次**提交前**的完整视图，要么对应**提交后**的完整视图；
+- 不会返回“旧 `revision` 配提交后新结论”的响应，也不会出现 `evidence_path` 引用
+  某证据、但 `path_detail` 中该证据 `status` 已为 `retracted` 的响应；
+- 查询只读，不写库、不递增修订号，不改变请求路径、查询参数与响应字段；地层未登记
+  仍返回 400 `INVALID_STRATUM`；路径规则仍为证据数最少、并列按证据编号序列字典序最小。
+
+推演关系查询 `GET /projections/{id}/relationship?a=...&b=...` 同口径：推演状态
+`status`、`base_revision`、`projection_revision`、关系结论、最优证据路径与逐步明细
+（`scope=base/projection`）取自该推演的同一冻结视图快照；并发推演批次在读取语句间
+提交时同样只可能整体返回提交前或提交后的结果；已关闭推演（`merged` / `discarded`）
+仍可查询冻结视图，地层不在推演基线内返回 400 `INVALID_STRATUM`、推演不存在返回
+404 `PROJECTION_NOT_FOUND`。
+
+```bash
+# 并发提交下的同视图行为演示（含多线程并发查询校验、推演冻结视图、错误约定）
+bash examples/relationship_view_demo.sh
+```
+
 ### 证据撤回承受力分析：`POST /resilience/retraction-analysis`（只读）
 
 考古人员核对当前地层关系时，需要知道它对**证据撤回**的承受力：若允许在**同一正式视图**
@@ -1118,6 +1152,10 @@ bash examples/changes_demo.sh
    - 可撤回推演自己新增的断言，也可撤回基线断言；撤回同样只置状态、不可重复。
 3. **推演查询**：`GET /projections/{id}/relationship` 返回推演视角下的关系与证据路径，
    `path_detail[].scope` 标注每步证据来源：`base`（基线）/ `projection`（推演新增）。
+   查询在 `REPEATABLE READ READ ONLY` 只读快照事务内完成：推演状态、基线 / 推演修订号、
+   关系结论、最优证据路径与逐步明细取自同一冻结视图，并发推演批次在读取语句之间提交
+   时只可能整体读到提交前或提交后的结果（不混版）；已关闭推演（merged/discarded）
+   仍可查询其冻结视图。
 4. **并入（merge）**：把推演相对基线的**净变更**（推演内仍生效的新增 + 被撤回的基线断言；
    “新增后又撤回”不产生净变更）应用到**最新**正式状态并重新核验：
    - 基线撤回目标已在正式状态撤回 → `MERGE_TARGET_RETRACTED`；
@@ -1383,6 +1421,14 @@ bash examples/package_reconciliation_demo.sh
 bash examples/demo.sh
 ```
 
+两类关系查询“同一次响应同一完整视图”演示（正式查询修订号/结论/路径/逐步明细同视图、
+并发批次在读取间提交时的不混版校验、推演冻结视图、已关闭推演可查、未知地层 / 未知
+推演错误约定）：
+
+```bash
+bash examples/relationship_view_demo.sh
+```
+
 分期骨架视图演示（无断言各自成组、同一期等价组、平行断言合并、
 传递边省略、孤立地层、过期修订号拒绝、撤回后骨架重算）：
 
@@ -1477,14 +1523,14 @@ python3 examples/client_demo.py
 ```
 app/
   main.py         # FastAPI 路由与错误处理
-  service.py      # 正式批次核验、关系查询、定版快照
+  service.py      # 正式批次核验、关系查询（只读快照同视图）、定版快照
   field.py        # 野外终端离线整包汇入与勘误替换：短号建层/跨包绑定、稳定证据编号、整批核验、包台账幂等、撤回替换链
   holds.py        # 争议证据临时保全：一次性解除凭据（哈希存证）、生效保全来源查询、正式撤回三路径拦截与预检只读拦截、行锁同序裁决
   preflight.py    # 提交前只读预检：求消除本批冲突所需撤回的最少生效旧证据（预算 0～3；受保全证据不进建议，直接撤回按 EVIDENCE_HELD 拒绝）
   resilience.py   # 证据撤回承受力（只读）：混合证据图最小割求让两层关系变未定的最少撤回（含受保护集合）
   packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
   reconciliation.py # 成果包交付前只读复核：封存结论/最优路径与当前结果逐项比较、首次偏离追溯
-  projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询、并入核验
+  projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询（冻结快照同视图）、并入核验
   periodization.py # 分期骨架视图（只读）：同一期等价组、组间传递约简直接早于边
   arrangement.py   # 分期试排（只读）：总期数+锚点约束下每组在所有可行排布中的最早/最晚期位
   changes.py      # 正式修订变化追踪：锥集候选定位 + 候选对精算、游标分页、启动历史回填
@@ -1493,6 +1539,7 @@ app/
   models.py       # 请求模型
 examples/
   demo.sh           # curl 端到端示例（批次/查询/冲突/撤回/定版）
+  relationship_view_demo.sh # 两类关系查询同视图示例（并发提交不混版/推演冻结视图/已关闭可查/错误约定）
   periodization_demo.sh # 分期骨架视图示例（等价组/平行合并/传递省略/过期拒绝/撤回重算）
   arrangement_demo.sh # 分期试排示例（最早/最晚界、锚点、三类不可行证据链、推演冻结视图）
   preflight_demo.sh # 提交前只读预检示例（最少撤回/预算不足/新断言自相矛盾/拒绝/保全联动：EVIDENCE_HELD 与建议排除受保全证据/只读校验）
@@ -1508,6 +1555,8 @@ examples/
 tests/
   test_relation_diffs_equivalence.py # 变化追踪候选精算 vs 全库逐对口径等价性（纯函数，无需数据库）
   test_preflight_holds.py            # 预检与临时保全联动回归：EVIDENCE_HELD 同构拒绝、受保全证据排除、解除恢复（内存假连接，无需数据库）
+  test_relationship_view_consistency.py # 两类关系查询同视图回归（内存假连接：注入并发提交，断言修订号/结论/路径明细不混版）
+  test_relationship_view_consistency_e2e.py # 同上的真实 PostgreSQL 端到端验证（语句门闩确定性交错 + 多线程压力）
   bench_relation_diffs.py            # 大量无关地层 + 局部变更性能基准（纯函数）
 Dockerfile
 docker-compose.yml

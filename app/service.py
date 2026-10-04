@@ -175,8 +175,18 @@ def apply_batch(batch: BatchIn) -> Dict[str, Any]:
 
 # ------------------------------------------------------------------ 查询
 def query_relationship(a: str, b: str) -> Dict[str, Any]:
+    """正式关系查询：修订号、关系结论、最优证据路径与逐步明细取自同一完整视图。
+
+    全程在 REPEATABLE READ READ ONLY 只读快照事务内完成：并发正式批次（含野外整包
+    汇入 / 勘误、推演并入）若在各条读取语句之间提交，本查询要么整体取到提交前状态、
+    要么整体取到提交后状态，绝不把旧修订号与新结论混在一次响应里，路径中的证据也不
+    会在逐步明细中显示为已撤回。不写库、不递增修订号，不改变既有请求与返回字段。
+    """
     with db_conn() as conn:
         with conn.cursor() as cur:
+            # 只读快照事务：修订号、生效断言集与逐步明细取自同一事务快照；
+            # SET TRANSACTION 仅对当前事务生效，连接归还池后下一事务恢复默认模式。
+            cur.execute("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
             _ensure_strata(cur, a, b)
             revision = _current_revision(cur)
             derivation = Derivation(_load_active(cur))

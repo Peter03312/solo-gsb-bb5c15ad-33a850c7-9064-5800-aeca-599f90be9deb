@@ -471,8 +471,21 @@ def apply_projection_batch(projection_id: int, batch: ProjectionBatchIn) -> Dict
 
 # ------------------------------------------------------------------ 推演内关系查询
 def query_projection_relationship(projection_id: int, a: str, b: str) -> Dict[str, Any]:
+    """查询推演冻结视角下的关系：推演修订号 / 状态、关系结论、最优证据路径与逐步
+    明细对应同一完整视图。
+
+    全程在 REPEATABLE READ READ ONLY 只读快照事务内完成：并发推演批次若在各条读取
+    语句之间提交，本查询要么整体取到提交前的推演视图、要么整体取到提交后的视图，
+    绝不把旧推演修订号与新结论混在一次响应里，也不会把路径中的证据显示为已撤回
+    （基线证据的 strata/relation 从正式历史表还原时同样取同一快照；其是否在推演内
+    撤回以视图内撤回集合为准）。已关闭推演（merged/discarded）仍可查询冻结视图。
+    不写任何表、不改变推演状态与正式修订。
+    """
     with db_conn() as conn:
         with conn.cursor() as cur:
+            # 只读快照事务：推演行、增撤记录、生效视图与逐步明细取自同一事务快照；
+            # SET TRANSACTION 仅对当前事务生效，连接归还池后下一事务恢复默认模式。
+            cur.execute("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
             proj = _get_projection(cur, projection_id)
             if a not in proj["base_strata"]:
                 raise ApiError(400, "INVALID_STRATUM", f"地层未登记（推演基线内不存在）: {a}", {"stratum_id": a})
