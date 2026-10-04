@@ -1,4 +1,9 @@
-"""业务逻辑：批次应用、关系查询、定版快照。"""
+"""业务逻辑：批次应用、关系查询、定版快照。
+
+关系查询（GET /relationship）在 REPEATABLE READ READ ONLY 只读快照事务内完成：
+修订号、关系结论、最优证据路径与逐步证据明细对应同一完整视图，并发批次提交只可能
+让整次查询整体落在提交前或提交后，不产生混版响应。
+"""
 from typing import Any, Dict, List, Optional
 
 from psycopg2.extras import Json
@@ -177,10 +182,17 @@ def apply_batch(batch: BatchIn) -> Dict[str, Any]:
 def query_relationship(a: str, b: str) -> Dict[str, Any]:
     with db_conn() as conn:
         with conn.cursor() as cur:
+            # 只读快照事务：修订号、生效断言集与逐步证据明细取自**同一事务快照**。
+            # 否则并发批次在多次读取之间提交时，可能把旧修订号配上新结论，或把路径
+            # 上的证据显示为已撤回（混版）。SET TRANSACTION 仅对当前事务生效，连接
+            # 归还连接池后下一事务恢复默认模式。快照要么取批次提交前、要么取提交后，
+            # 但绝不返回混合版本。
+            cur.execute("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
             _ensure_strata(cur, a, b)
             revision = _current_revision(cur)
             derivation = Derivation(_load_active(cur))
             relation, path = derivation.relation(a, b)
+            # path_detail 与结论共用同一快照：路径中的证据状态按本快照解释。
             payload = _relation_payload(relation, path, cur)
             payload.update({"stratum_a": a, "stratum_b": b, "revision": revision})
             return payload

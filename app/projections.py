@@ -13,6 +13,11 @@ projection_* 表，正式状态不变。提交（merge）时把推演相对基�
 - 撤回：基线中生效、且被推演撤回的证据（推演内“新增后又撤回”不产生净变更）。
 
 净变更为空：只关闭推演，不递增正式修订号。
+
+关系查询（GET /projections/{id}/relationship）在 REPEATABLE READ READ ONLY 只读
+快照事务内完成：推演修订号 / 状态、推演增撤记录、关系结论、最优证据路径与逐步证据
+明细对应同一完整冻结视图；并发推演批次提交只可能让整次查询整体落在提交前或提交后，
+不产生混版响应。已关闭（merged/discarded）推演仍可查询冻结视图。
 """
 from typing import Any, Dict, List, Optional
 
@@ -473,6 +478,12 @@ def apply_projection_batch(projection_id: int, batch: ProjectionBatchIn) -> Dict
 def query_projection_relationship(projection_id: int, a: str, b: str) -> Dict[str, Any]:
     with db_conn() as conn:
         with conn.cursor() as cur:
+            # 只读快照事务：推演行（推演修订号 / 状态）、推演增撤记录、基线快照与
+            # 逐步证据明细取自**同一事务快照**。否则并发推演批次在多次读取之间提交时，
+            # 可能把旧推演修订号配上新结论，或把生效路径中的基线证据显示为已撤回。
+            # 快照要么取批次提交前、要么取提交后，绝不混版；已关闭推演的冻结视图
+            # 同样只读可查（不锁行、不要求 open）。SET TRANSACTION 仅对当前事务生效。
+            cur.execute("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
             proj = _get_projection(cur, projection_id)
             if a not in proj["base_strata"]:
                 raise ApiError(400, "INVALID_STRATUM", f"地层未登记（推演基线内不存在）: {a}", {"stratum_id": a})
@@ -482,7 +493,7 @@ def query_projection_relationship(projection_id: int, a: str, b: str) -> Dict[st
             derivation = Derivation(effective)
             relation, path = derivation.relation(a, b)
 
-            # path_detail（含 scope 标注；status 取推演视角）
+            # path_detail 与结论共用同一快照（含 scope 标注；status 取推演视角）
             path_detail = _projection_path_details(cur, projection_id, path, retracted_ids=view_retracted)
             return {
                 "projection_id": projection_id,

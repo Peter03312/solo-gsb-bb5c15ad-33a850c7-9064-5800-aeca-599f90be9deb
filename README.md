@@ -14,6 +14,14 @@
 - **批次语义**：每批新增/撤回须携带当前修订号；按整批应用后的最终关系核验；
   发生矛盾时**整批拒绝**并返回冲突证据路径，原状态不变；全部通过则在同一事务内落库并**原子递增修订号**。
 - **路径选取**：多条证据路径时，取证据数最少者；并列时按证据编号序列字典序最小者。
+- **关系查询视图一致性**：正式关系查询（`GET /relationship`，输入两地层编号）与推演关系
+  查询（`GET /projections/{id}/relationship`，另带推演编号）均在 `REPEATABLE READ READ
+  ONLY` 只读快照事务内**一次取视图**：一次响应中的修订号（推演另含推演状态与推演修订号）、
+  关系结论、最优证据路径和逐步证据明细恒对应同一完整视图。并发正式 / 推演批次在读取之间
+  提交时，整次响应取提交前或提交后的结果，但**绝不混版**（不会旧修订号配新结论，也不会把
+  路径中的生效证据显示为已撤回）。查询入口、输入输出字段、未知地层 / 未知推演的错误约定
+  （400 `INVALID_STRATUM` / 404 `PROJECTION_NOT_FOUND`）与路径规则不变；已关闭推演仍可
+  查询其冻结视图。
 - **定版（快照）**：保存当前修订号下全部关系结论的不可变快照；后续撤回不影响旧版结论。
 - **专题成果包**：把某定版中的一组（≥2、不重复、已登记）地层封存为不可变、可转交
   复核包：只含按编号排序的无序两两关系，结论与最优路径同该定版查询，确定结论携带
@@ -272,7 +280,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/revision` | 当前修订号 |
 | GET | `/assertions?status=active` | 断言列表 |
 | GET | `/revision-changes?limit=100&cursor=...` | 游标分页追踪各正式修订前后关系/最优路径变化 |
-| GET | `/relationship?a=L1&b=L3` | 查询两地层当前关系及支撑证据路径 |
+| GET | `/relationship?a=L1&b=L3` | 查询两地层当前关系及支撑证据路径（同一只读快照视图，并发提交不混版） |
 | POST | `/resilience/retraction-analysis` | 只读证据撤回承受力分析：求让指定两层关系变为未定的最少生效证据撤回（含受保护证据集合） |
 | GET | `/periodization?expected_revision=1` | 只读分期骨架：同一期等价组 + 组间传递约简后的直接早于边（含孤立地层） |
 | POST | `/periodization/arrangement` | 正式视图只读分期试排：总期数 1～64 + 期位锚点，返回每组在所有可行排布中的最早/最晚期位 |
@@ -283,7 +291,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/projections` | 创建推演（固定当前修订号、地层与生效断言） `{label?}` |
 | GET | `/projections` / `/projections/{id}` | 推演列表 / 推演详情（含净变更） |
 | POST | `/projections/{id}/batches` | 推演内提交批次（携带推演修订号，语义同正式批次） |
-| GET | `/projections/{id}/relationship?a=L1&b=L3` | 查询推演视角下的关系与证据路径 |
+| GET | `/projections/{id}/relationship?a=L1&b=L3` | 查询推演视角下的关系与证据路径（同一只读快照视图，已关闭推演仍可查冻结视图） |
 | POST | `/projections/{id}/merge` | 并入：净变更应用于最新正式状态并重新核验 |
 | DELETE | `/projections/{id}` | 放弃推演（仅 open 可放弃） |
 | POST | `/packages` | 封存专题成果包：把定版中的一组地层关系冻结为可转交复核包 `{version, strata[]}` |
@@ -656,6 +664,16 @@ bash examples/field_package_corrections_demo.sh
 
 ### 关系查询响应
 
+`GET /relationship?a=...&b=...` 输入两个已登记地层编号，返回当前正式修订视图下的关系
+结论、最优证据路径与逐步证据明细。**整次查询在 `REPEATABLE READ READ ONLY` 只读快照
+事务内完成**：响应中的 `revision`（修订号）、`relation`（关系结论）、`evidence_path`
+（最优证据路径）与 `path_detail`（逐步证据明细，含每条证据的端点、关系与 `status`）
+对应**同一完整视图**。并发正式批次在查询的多次读取之间提交时，整次查询要么取批次
+**提交前**、要么取批次**提交后**的完整视图，绝不会出现“旧修订号配上新结论”或“路径
+中的证据被显示为已撤回”的混版响应；调用方如需修订号严格等于预期值，可比对返回的
+`revision` 后重试。查询只读，不写库、不递增修订号、不产生变化记录；任一地层未登记
+仍返回 400 `INVALID_STRATUM`。
+
 ```json
 {
   "stratum_a": "L1",
@@ -672,6 +690,16 @@ bash examples/field_package_corrections_demo.sh
 ```
 
 `relation` 取值：`same_period`（同一期）/ `earlier_than`（早于）/ `later_than`（晚于）/ `undetermined`（未定）。
+路径选取规则不变：证据数最少，并列时按证据编号序列字典序最小；未定关系 `evidence_path`
+为 `null`、`path_detail` 为空数组。
+
+```bash
+# 正式关系查询（两地层编号）
+curl -s "$BASE/relationship?a=L1&b=L3"
+
+# 并发混版回归演示（正式 / 推演两类查询在批次并发提交下不混版）
+bash examples/relationship_consistency_demo.sh
+```
 
 ### 证据撤回承受力分析：`POST /resilience/retraction-analysis`（只读）
 
@@ -1116,8 +1144,15 @@ bash examples/changes_demo.sh
    - **正式历史已用证据编号不可复用**（含已撤回，查正式 `assertions`），
      **推演新增编号在本推演内不可复用**（含在推演内已撤回）；
    - 可撤回推演自己新增的断言，也可撤回基线断言；撤回同样只置状态、不可重复。
-3. **推演查询**：`GET /projections/{id}/relationship` 返回推演视角下的关系与证据路径，
-   `path_detail[].scope` 标注每步证据来源：`base`（基线）/ `projection`（推演新增）。
+3. **推演查询**：`GET /projections/{id}/relationship` 输入两地层编号（推演另由路径带
+   推演编号），返回推演视角下的关系与证据路径，`path_detail[].scope` 标注每步证据来源：
+   `base`（基线）/ `projection`（推演新增）。**整次查询在 `REPEATABLE READ READ ONLY`
+   只读快照事务内完成**：`base_revision`、`projection_revision`、`status`（推演状态）、
+   关系结论、最优证据路径与逐步证据明细对应**同一完整冻结视图**。并发推演批次在查询的
+   多次读取之间提交时，整次查询要么取批次提交前、要么取提交后的完整视图，绝不会出现
+   “旧推演修订号配上新结论”或把生效路径中的基线证据显示为已撤回的混版响应。查询只读，
+   不写任何表；推演不存在返回 404 `PROJECTION_NOT_FOUND`，地层不在推演基线内返回 400
+   `INVALID_STRATUM`。
 4. **并入（merge）**：把推演相对基线的**净变更**（推演内仍生效的新增 + 被撤回的基线断言；
    “新增后又撤回”不产生净变更）应用到**最新**正式状态并重新核验：
    - 基线撤回目标已在正式状态撤回 → `MERGE_TARGET_RETRACTED`；
@@ -1465,6 +1500,14 @@ bash examples/field_package_corrections_demo.sh
 bash examples/evidence_holds_demo.sh
 ```
 
+两类关系查询并发一致性演示（正式 / 推演查询在批次并发提交下，修订号、推演状态、
+关系结论、最优证据路径与逐步证据明细恒对应同一完整视图，可整体取提交前或提交后
+但不混版；已关闭推演冻结视图、未知地层 / 未知推演错误约定）：
+
+```bash
+bash examples/relationship_consistency_demo.sh
+```
+
 Python 客户端示例：
 
 ```bash
@@ -1504,10 +1547,12 @@ examples/
   field_packages_demo.sh # 野外终端离线整包汇入示例（短号绑定/稳定编号/整批核验/幂等/拒绝分支）
   field_package_corrections_demo.sh # 已汇入整包勘误示例（撤回+新包单事务/幂等/替换链/台账/冲突回滚/历史可查）
   evidence_holds_demo.sh # 争议证据临时保全示例（一次性凭据/状态与来源查询/多保全重叠/撤回拦截三路径/推演内撤回不受限）
+  relationship_consistency_demo.sh # 两类关系查询并发不混版示例（快照视图、提交前/后整体读取、已关闭推演冻结视图、错误约定）
   client_demo.py    # Python 客户端示例
 tests/
   test_relation_diffs_equivalence.py # 变化追踪候选精算 vs 全库逐对口径等价性（纯函数，无需数据库）
   test_preflight_holds.py            # 预检与临时保全联动回归：EVIDENCE_HELD 同构拒绝、受保全证据排除、解除恢复（内存假连接，无需数据库）
+  test_relationship_snapshot.py      # 两类关系查询同一完整视图回归：快照开启、修订号/结论/路径/明细一致、旧口径混版复现（内存假连接，无需数据库）
   bench_relation_diffs.py            # 大量无关地层 + 局部变更性能基准（纯函数）
 Dockerfile
 docker-compose.yml

@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.13.0",
+    version="1.14.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
@@ -380,7 +380,14 @@ def get_field_package_correction(terminal_id: str, original_package_no: str, new
 # ------------------------------------------------------------------ 关系查询
 @app.get("/relationship", tags=["query"])
 def get_relationship(a: str = Query(description="地层编号"), b: str = Query(description="地层编号")):
-    """查询两地层当前关系：同一期 / 早于 / 晚于 / 未定，附支撑证据路径。"""
+    """查询两地层当前关系：同一期 / 早于 / 晚于 / 未定，附支撑证据路径。
+
+    整次查询在 `REPEATABLE READ READ ONLY` 只读快照事务内完成：修订号、关系结论、
+    最优证据路径与逐步证据明细（含每条证据状态）对应**同一完整视图**。并发批次在
+    读取间提交时，响应取提交前或提交后的完整视图，不返回旧修订号配新结论或把路径
+    证据显示为已撤回的混版结果。查询只读，不写库、不递增修订号、不产生变化记录；
+    地层未登记仍返回 400 INVALID_STRATUM。
+    """
     return service.query_relationship(a, b)
 
 
@@ -570,7 +577,15 @@ def post_projection_batch(projection_id: int, batch: ProjectionBatchIn):
 def get_projection_relationship(
     projection_id: int, a: str = Query(description="地层编号"), b: str = Query(description="地层编号")
 ):
-    """查询推演视角下两地层的关系及支撑证据路径（路径标注 base/projection 来源）。"""
+    """查询推演视角下两地层的关系及支撑证据路径（路径标注 base/projection 来源）。
+
+    整次查询在 `REPEATABLE READ READ ONLY` 只读快照事务内完成：基线修订号、推演修订号
+    与推演状态、关系结论、最优证据路径及逐步证据明细对应**同一完整冻结视图**。并发推演
+    批次在读取间提交时，响应取提交前或提交后的完整视图，不返回旧推演修订号配新结论、
+    或把生效路径中的基线证据显示为已撤回的混版结果。已关闭（merged/discarded）推演仍可
+    查询其冻结视图；推演不存在 404 PROJECTION_NOT_FOUND，地层不在推演基线内 400
+    INVALID_STRATUM。查询只读，不写任何表、不改变推演状态与正式修订。
+    """
     return projections.query_projection_relationship(projection_id, a, b)
 
 
